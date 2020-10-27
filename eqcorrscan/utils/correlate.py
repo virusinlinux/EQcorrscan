@@ -362,6 +362,94 @@ def get_array_xcorr(name_or_func=None):
 # ----------------------- registered array_xcorr functions
 
 
+@register_array_xcorr('cuda')
+def cupy_normxcorr(templates, stream, pads, *args, **kwargs):
+    """
+    Compute the normalized cross-correlation using numpy and bottleneck.
+
+    :param templates: 2D Array of templates
+    :type templates: np.ndarray
+    :param stream: 1D array of continuous data
+    :type stream: np.ndarray
+    :param pads: List of ints of pad lengths in the same order as templates
+    :type pads: list
+
+    :return: np.ndarray of cross-correlations
+    :return: np.ndarray channels used
+    """
+    try:
+        import cupy as cp
+        import cupyx as cpx
+    except ImportError as e:
+        Logger.error(f"Could not import cupy due to {e}."
+                     "\nCalling numpy_normxcorr instead")
+        return numpy_normxcorr(
+            template=templates, stream=stream, pads=pads, *args, **kwargs)
+    """
+    TODO:
+    
+    1. Work out a github bot that tracks changes to this function and ensures 
+       that it gets tested when changed (I don't have a GPU equipped CI system) 
+    2. Convert data to gpu data
+    3. Make a running mean and running std GPU function - could use CPU for now.
+    4. Bring it back to cpu
+    
+    """
+    import bottleneck
+
+    # Generate a template mask
+    used_chans = ~np.isnan(templates).any(axis=1)
+    # Currently have to use float64 as bottleneck runs into issues with other
+    # types: https://github.com/kwgoodman/bottleneck/issues/164
+    stream = stream.astype(np.float64)
+    templates = templates.astype(np.float64)
+    template_length = templates.shape[1]
+    stream_length = len(stream)
+    assert stream_length > template_length, "Template must be shorter than " \
+                                            "stream"
+    fftshape = next_fast_len(template_length + stream_length - 1)
+    # Set up normalizers
+    # TODO: Do this on the GPU
+    stream_mean_array = bottleneck.move_mean(
+        stream, template_length)[template_length - 1:]
+    stream_std_array = bottleneck.move_std(
+        stream, template_length)[template_length - 1:]
+    # because stream_std_array is in denominator or res, nan all 0s
+    stream_std_array[stream_std_array == 0] = np.nan
+    # Normalize and flip the templates
+    norm = ((templates - templates.mean(axis=-1, keepdims=True)) / (
+        templates.std(axis=-1, keepdims=True) * template_length))
+    norm_sum = norm.sum(axis=-1, keepdims=True)
+    # Move to GPU
+    stream = cp.asarray(stream)
+    norm = cp.asarray(norm)
+    # Compute FFTs
+    stream_fft = cpx.scipy.fft.rfft(stream, fftshape)
+    template_fft = cpx.scipy.fft.rfft(np.flip(norm, axis=-1), fftshape, axis=-1)
+    res = cpx.scipy.fft.irfft(
+        template_fft * stream_fft,
+        fftshape)[:, 0:template_length + stream_length - 1]
+
+    # Move back to RAM
+    res = cp.asnumpy(res)
+    # Center
+    res = ((_centered(res, (templates.shape[0],
+                            stream_length - template_length + 1))) -
+           norm_sum * stream_mean_array) / stream_std_array
+    res[np.isnan(res)] = 0.0
+
+    for i, pad in enumerate(pads):
+        res[i] = np.append(res[i], np.zeros(pad))[pad:]
+    return res.astype(np.float32), used_chans
+
+
+# Cannot run multiprocessing with cuda
+# TODO: Use a 2D FFT to speed up multi-channel correlations?
+cupy_normxcorr.multithread = _general_serial(cupy_normxcorr)
+cupy_normxcorr.multiprocess = _general_serial(cupy_normxcorr)
+cupy_normxcorr.concurrent = _general_serial(cupy_normxcorr)
+
+
 @register_array_xcorr('numpy')
 def numpy_normxcorr(templates, stream, pads, *args, **kwargs):
     """
